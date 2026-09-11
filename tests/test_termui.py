@@ -1,10 +1,14 @@
+import io
+import os
 import platform
 import time
+from unittest.mock import patch
 
 import pytest
 
 import click._termui_impl
 from click._compat import WIN
+from click._termui_impl import Editor
 
 
 class FakeClock:
@@ -367,6 +371,426 @@ def test_getchar_windows_exceptions(runner, monkeypatch, key_char, exc):
 def test_fast_edit(runner):
     result = click.edit("a\nb", editor="sed -i~ 's/$/Test/'")
     assert result == "aTest\nbTest\n"
+
+
+@pytest.mark.parametrize(
+    ("editor_cmd", "filename", "expected_args"),
+    [
+        pytest.param(
+            "myeditor --wait --flag",
+            "file1.txt",
+            ["myeditor", "--wait", "--flag", "file1.txt"],
+            id="editor with args",
+        ),
+        pytest.param(
+            "vi",
+            'file"; rm -rf / ; echo "',
+            ["vi", 'file"; rm -rf / ; echo "'],
+            id="shell metacharacters in filename",
+        ),
+        # The editor command comes from VISUAL/EDITOR, so metacharacters in
+        # it must be passed through as plain argv items, never interpreted.
+        pytest.param(
+            "vi ; touch pwned",
+            "f.txt",
+            ["vi", ";", "touch", "pwned", "f.txt"],
+            id="shell metacharacters in editor command",
+        ),
+        pytest.param(
+            "vi && touch pwned",
+            "f.txt",
+            ["vi", "&&", "touch", "pwned", "f.txt"],
+            id="shell and-operator in editor command",
+        ),
+        pytest.param(
+            "vi $(touch pwned)",
+            "f.txt",
+            ["vi", "$(touch", "pwned)", "f.txt"],
+            id="shell substitution in editor command",
+        ),
+        # Issue #1026: editor path with spaces must be quoted.
+        pytest.param(
+            '"C:\\Program Files\\Sublime Text 3\\sublime_text.exe"',
+            "f.txt",
+            ["C:\\Program Files\\Sublime Text 3\\sublime_text.exe", "f.txt"],
+            id="quoted windows path with spaces",
+        ),
+        # PR #1477: pager/editor command with flags, like ``less -FRSX``.
+        pytest.param(
+            "less -FRSX",
+            "f.txt",
+            ["less", "-FRSX", "f.txt"],
+            id="command with flags",
+        ),
+        # Issue #1026: quoted command with an option.
+        pytest.param(
+            '"my command" --option value arg',
+            "f.txt",
+            ["my command", "--option", "value", "arg", "f.txt"],
+            id="quoted command with args",
+        ),
+        # PR #1477: unquoted unix path.
+        pytest.param(
+            "/usr/bin/vim",
+            "f.txt",
+            ["/usr/bin/vim", "f.txt"],
+            id="unix absolute path",
+        ),
+        # Issue #1026: macOS path with escaped space.
+        pytest.param(
+            "/Applications/Sublime\\ Text.app/Contents/SharedSupport/bin/subl",
+            "f.txt",
+            ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl", "f.txt"],
+            id="escaped space in unix path",
+        ),
+        pytest.param(
+            "  vim  ",
+            "f.txt",
+            ["vim", "f.txt"],
+            id="leading and trailing whitespace",
+        ),
+        pytest.param(
+            "vim\t-N",
+            "f.txt",
+            ["vim", "-N", "f.txt"],
+            id="tab-separated tokens",
+        ),
+        pytest.param(
+            "'/Applications/My Editor.app/Contents/MacOS/editor'",
+            "f.txt",
+            ["/Applications/My Editor.app/Contents/MacOS/editor", "f.txt"],
+            id="single-quoted path with spaces",
+        ),
+        pytest.param(
+            '"my editor" --wait --new-window',
+            "file 1.txt",
+            ["my editor", "--wait", "--new-window", "file 1.txt"],
+            id="quoted editor with flags and filename with spaces",
+        ),
+        pytest.param(
+            "vim -u NONE -N",
+            "f.txt",
+            ["vim", "-u", "NONE", "-N", "f.txt"],
+            id="multiple short flags",
+        ),
+        pytest.param(
+            "editor",
+            'file"name.txt',
+            ["editor", 'file"name.txt'],
+            id="filename with double quote",
+        ),
+        pytest.param(
+            "editor",
+            "file'name.txt",
+            ["editor", "file'name.txt"],
+            id="filename with single quote",
+        ),
+    ],
+)
+def test_editor_path_normalization(editor_cmd, filename, expected_args):
+    """The editor command is split into an argv list and passed to
+    ``Popen`` without a shell, so its content is never interpreted.
+    """
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 0
+        Editor(editor=editor_cmd).edit_file(filename)
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[1].get("args") or mock_popen.call_args[0][0]
+        assert args == expected_args
+        assert mock_popen.call_args[1].get("shell") is None
+
+
+@pytest.mark.parametrize("env_key", ["VISUAL", "EDITOR"])
+def test_editor_env_var_not_shell_interpreted(monkeypatch, env_key):
+    """An editor taken from ``VISUAL``/``EDITOR`` is not run through a
+    shell, so it cannot be used to inject commands.
+    """
+    monkeypatch.delitem(os.environ, "VISUAL", raising=False)
+    monkeypatch.delitem(os.environ, "EDITOR", raising=False)
+    monkeypatch.setitem(os.environ, env_key, "vi ; touch pwned")
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 0
+        Editor().edit_file("f.txt")
+
+        args = mock_popen.call_args[1].get("args") or mock_popen.call_args[0][0]
+        assert args == ["vi", ";", "touch", "pwned", "f.txt"]
+        assert mock_popen.call_args[1].get("shell") is None
+
+
+@pytest.mark.skipif(WIN, reason="Uses POSIX shell syntax and the echo command.")
+def test_editor_no_command_injection(monkeypatch, tmp_path):
+    """An ``EDITOR`` value carrying shell metacharacters must not execute
+    the injected command.
+    """
+    marker = tmp_path / "pwned.txt"
+    monkeypatch.delitem(os.environ, "VISUAL", raising=False)
+    monkeypatch.setitem(os.environ, "EDITOR", f"echo ; touch {marker}")
+
+    click.edit("a\nb")
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(not WIN, reason="Windows-specific editor paths")
+@pytest.mark.parametrize(
+    ("editor_cmd", "expected_cmd"),
+    [
+        pytest.param(
+            "notepad",
+            ["notepad"],
+            id="plain notepad",
+        ),
+        pytest.param(
+            '"C:\\Program Files\\Sublime Text 3\\sublime_text.exe" --wait',
+            ["C:\\Program Files\\Sublime Text 3\\sublime_text.exe", "--wait"],
+            id="quoted path with flag",
+        ),
+    ],
+)
+def test_editor_windows_path_normalization(editor_cmd, expected_cmd):
+    """Windows-specific tests: verify ``Popen`` receives unquoted paths that
+    ``subprocess.list2cmdline`` can re-quote for ``CreateProcess``."""
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 0
+        Editor(editor=editor_cmd).edit_file("f.txt")
+
+        args = mock_popen.call_args[1].get("args") or mock_popen.call_args[0][0]
+        assert args == expected_cmd + ["f.txt"]
+        assert mock_popen.call_args[1].get("shell") is None
+
+
+def test_editor_env_passed_through():
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 0
+        Editor(editor="vi", env={"MY_VAR": "1"}).edit_file("f.txt")
+
+        env = mock_popen.call_args[1].get("env")
+        assert env is not None
+        assert env["MY_VAR"] == "1"
+
+
+def test_editor_failure_exception():
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 1
+        with pytest.raises(click.ClickException, match="Editing failed"):
+            Editor(editor="vi").edit_file("f.txt")
+
+
+def test_editor_nonexistent_exception():
+    with patch("subprocess.Popen", side_effect=OSError("not found")):
+        with pytest.raises(click.ClickException, match="not found"):
+            Editor(editor="nonexistent").edit_file("f.txt")
+
+
+def test_editor_unclosed_quote():
+    """An unclosed quote in the editor command raises ValueError."""
+    with pytest.raises(ValueError, match="No closing quotation"):
+        Editor(editor='"unclosed').edit_file("f.txt")
+
+
+@pytest.mark.parametrize(
+    ("pager_env", "expected_parts"),
+    [
+        # Simple commands.
+        pytest.param("cat", ["cat"], id="simple command"),
+        pytest.param("less", ["less"], id="less"),
+        pytest.param("less -FRSX", ["less", "-FRSX"], id="command with flags"),
+        # Whitespace handling.
+        pytest.param("  less  ", ["less"], id="leading and trailing spaces"),
+        pytest.param("less\t-R", ["less", "-R"], id="tab as separator"),
+        # Quoted Windows paths: quotes are stripped in POSIX mode (the
+        # default), preserving backslashes inside quoted tokens (issue #1026).
+        pytest.param(
+            '"C:\\Program Files\\Git\\usr\\bin\\less.exe"',
+            ["C:\\Program Files\\Git\\usr\\bin\\less.exe"],
+            id="quoted windows path with spaces",
+        ),
+        pytest.param(
+            '"C:\\Program Files\\Git\\usr\\bin\\less.exe" -R',
+            ["C:\\Program Files\\Git\\usr\\bin\\less.exe", "-R"],
+            id="quoted windows path with flag",
+        ),
+        # Single-quoted path.
+        pytest.param(
+            "'/usr/local/bin/my pager'",
+            ["/usr/local/bin/my pager"],
+            id="single-quoted path with spaces",
+        ),
+        # Unix paths.
+        pytest.param("/usr/bin/less", ["/usr/bin/less"], id="unix absolute path"),
+        pytest.param(
+            "/usr/bin/my\\ pager",
+            ["/usr/bin/my pager"],
+            id="escaped space in unix path",
+        ),
+        # PR #1477: POSIX mode (the default) eats unquoted backslashes.
+        # On Windows, users must quote paths that contain backslashes.
+        pytest.param(
+            "C:\\path\\to\\exe /test other\\path",
+            ["C:pathtoexe", "/test", "otherpath"],
+            id="unquoted backslashes eaten in POSIX mode",
+        ),
+        # The injected command must survive as inert argv items.
+        pytest.param(
+            "less -R ; touch pwned",
+            ["less", "-R", ";", "touch", "pwned"],
+            id="shell metacharacters in pager command",
+        ),
+    ],
+)
+def test_pager_env_passed_to_popen_as_argv(monkeypatch, pager_env, expected_parts):
+    """The ``PAGER`` value is normalized into an ``argv`` list and handed to
+    ``subprocess.Popen`` without a shell.
+
+    Covers the splitting logic used by :func:`click._termui_impl.pager` to
+    turn the ``PAGER`` environment variable into an ``argv`` list. See
+    issue #1026, PR #1477, PR #1543, PR #2775.
+    """
+    monkeypatch.setattr(click._termui_impl, "WIN", False)
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    # Resolve every command to itself so the expected argv is exact and the
+    # test doesn't depend on which binaries the runner happens to have.
+    monkeypatch.setattr(click._termui_impl, "which", lambda cmd: cmd)
+    monkeypatch.setitem(os.environ, "PAGER", pager_env)
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.stdin = io.StringIO()
+        mock_popen.return_value.wait.return_value = 0
+        click.echo_via_pager("hello")
+
+    mock_popen.assert_called_once()
+    assert mock_popen.call_args[0][0] == expected_parts
+    assert mock_popen.call_args[1]["shell"] is False
+
+
+@pytest.mark.parametrize("pager_env", ["", "   ", "\t"])
+def test_pager_env_empty_selects_no_command(monkeypatch, pager_env):
+    """An empty or whitespace-only ``PAGER`` yields no command parts, so no
+    pager is invoked with it.
+    """
+    recorded = []
+
+    def record(generator, cmd_parts, color):
+        recorded.append(cmd_parts)
+
+    monkeypatch.setattr(click._termui_impl, "WIN", False)
+    monkeypatch.setattr(click._termui_impl, "_pipepager", record)
+    monkeypatch.setattr(click._termui_impl, "_tempfilepager", record)
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setitem(os.environ, "PAGER", pager_env)
+    # Stop before the platform probing that follows an unset pager command.
+    monkeypatch.setitem(os.environ, "TERM", "dumb")
+
+    click.echo_via_pager("hello")
+
+    assert recorded == []
+
+
+@pytest.mark.parametrize("win", [False, True])
+def test_pager_env_split_into_argv(monkeypatch, win):
+    """``pager()`` hands the ``PAGER`` value to its helpers as an argv
+    list, never as a shell command string.
+    """
+    recorded = []
+
+    def record(generator, cmd_parts, color):
+        recorded.append(cmd_parts)
+        return True
+
+    monkeypatch.setattr(click._termui_impl, "WIN", win)
+    monkeypatch.setattr(click._termui_impl, "_pipepager", record)
+    monkeypatch.setattr(click._termui_impl, "_tempfilepager", record)
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setitem(os.environ, "PAGER", "less -R ; touch pwned")
+
+    click.echo_via_pager("hello")
+
+    assert recorded == [["less", "-R", ";", "touch", "pwned"]]
+
+
+@pytest.mark.skipif(WIN, reason="Uses POSIX shell syntax and the cat command.")
+def test_echo_via_pager_no_command_injection(monkeypatch, tmp_path):
+    """A ``PAGER`` value carrying shell metacharacters must not execute the
+    injected command when the text is piped to the pager.
+    """
+    marker = tmp_path / "pwned.txt"
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setitem(os.environ, "PAGER", f"cat - ; touch {marker}")
+
+    click.echo_via_pager("hello")
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(WIN, reason="Uses POSIX shell syntax and a shell script pager.")
+def test_echo_via_pager_no_shell_for_resolved_pager(monkeypatch, tmp_path):
+    """The resolved pager path is executed directly, never handed to a
+    shell, so metacharacters in it can't start a second command.
+    """
+    monkeypatch.chdir(tmp_path)
+    # A directory whose name carries shell command separators. A shell would
+    # split the resolved pager path on them and run "touch pwned.txt".
+    bin_dir = tmp_path / "bin;touch pwned.txt;true"
+    bin_dir.mkdir()
+    pager_exe = bin_dir / "clickpager"
+    pager_exe.write_text("#!/bin/sh\ncat > /dev/null\n")
+    pager_exe.chmod(0o755)
+
+    monkeypatch.setitem(
+        os.environ, "PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setitem(os.environ, "PAGER", "clickpager")
+
+    click.echo_via_pager("hello")
+
+    assert not (tmp_path / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(WIN, reason="Uses POSIX shell syntax and the cat command.")
+def test_echo_via_pager_tempfile_no_command_injection(monkeypatch, tmp_path):
+    """The temp-file pager strategy, used on Windows, must not execute
+    commands injected through ``PAGER`` either.
+    """
+    marker = tmp_path / "pwned.txt"
+    monkeypatch.setattr(click._termui_impl, "WIN", True)
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setitem(os.environ, "PAGER", f"cat ; touch {marker}")
+
+    click.echo_via_pager("hello")
+
+    assert not marker.exists()
+
+
+def test_pager_passes_arguments_to_pipe_pager(monkeypatch):
+    """The pager's own arguments must reach it, they are not dropped."""
+    monkeypatch.setattr(click._termui_impl, "WIN", False)
+    monkeypatch.setattr(click._termui_impl, "isatty", lambda x: True)
+    monkeypatch.setattr(click._termui_impl, "which", lambda cmd: cmd)
+    monkeypatch.setitem(os.environ, "PAGER", "less -R")
+    monkeypatch.setitem(os.environ, "LESS", "")
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.stdin = io.StringIO()
+        mock_popen.return_value.wait.return_value = 0
+        click.echo_via_pager("hello")
+
+    assert mock_popen.call_args[0][0] == ["less", "-R"]
+    # The -R flag was seen, so colors are kept rather than LESS being set.
+    assert mock_popen.call_args[1]["env"]["LESS"] == ""
+
+
+def test_pager_no_command_parts_falls_through():
+    """The pager helpers refuse an empty argv list instead of invoking
+    something unexpected.
+    """
+    with patch("subprocess.Popen") as mock_popen:
+        assert click._termui_impl._pipepager(iter(["x"]), [], None) is False
+        assert click._termui_impl._tempfilepager(iter(["x"]), [], None) is False
+
+    mock_popen.assert_not_called()
 
 
 @pytest.mark.parametrize(
