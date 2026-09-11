@@ -1,11 +1,10 @@
 name: Publish
 on:
-  push:
-    tags:
-      - '*'
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       hash: ${{ steps.hash.outputs.hash }}
     steps:
@@ -17,7 +16,16 @@ jobs:
           cache-dependency-path: requirements*/*.txt
       - run: pip install -r requirements/build.txt
       # Use the commit date instead of the current date during the build.
-      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV
+      # Pin to the upstream 8.1.8 tag's commit date; the fork adds patch commits
+      # so `git log -1` would yield the fork's date and break byte-equivalence.
+      - run: echo "SOURCE_DATE_EPOCH=1734627852" >> $GITHUB_ENV
+      # Pin the build backend so the wheel's `Generator:` matches the published
+      # one (pyproject only requires `flit_core<4`, so a default isolated build
+      # installs the newest release and the Generator line drifts).
+      - name: pin build backend
+        run: |
+          echo "flit_core==3.10.1" > "${RUNNER_TEMP}/build-constraints.txt"
+          echo "PIP_CONSTRAINT=${RUNNER_TEMP}/build-constraints.txt" >> $GITHUB_ENV
       - run: python -m build
       # Generate hashes used for provenance.
       - name: generate hash
@@ -25,8 +33,11 @@ jobs:
         run: cd dist && echo "hash=$(sha256sum * | base64 -w0)" >> $GITHUB_OUTPUT
       - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
+          name: dist
           path: ./dist
+          if-no-files-found: error
   provenance:
+    if: false
     needs: [build]
     permissions:
       actions: read
@@ -37,10 +48,12 @@ jobs:
     with:
       base64-subjects: ${{ needs.build.outputs.hash }}
   create-release:
+    if: false
     # Upload the sdist, wheels, and provenance to a GitHub release. They remain
     # available as build artifacts for a while as well.
     needs: [provenance]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -53,6 +66,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
   publish-pypi:
+    if: false
     needs: [provenance]
     # Wait for approval before attempting to upload to PyPI. This allows reviewing the
     # files in the draft release.
@@ -60,6 +74,7 @@ jobs:
       name: publish
       url: https://pypi.org/project/click/${{ github.ref_name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       id-token: write
     steps:

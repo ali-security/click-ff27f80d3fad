@@ -5,8 +5,7 @@ name: Lock inactive closed issues
 # on old issues.
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  workflow_dispatch:
 permissions:
   issues: write
   pull-requests: write
@@ -15,6 +14,7 @@ concurrency:
 jobs:
   lock:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: dessant/lock-threads@1bf7ec25051fe7c00bdd17e6a7cf3d7bfb7dc771 # v5.0.1
         with:
